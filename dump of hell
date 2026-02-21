@@ -1,0 +1,139 @@
+def main():
+    """Enhanced example demonstrating all advanced features"""
+    print("="*70)
+    print("🚀 HYDROPREDICT ELITE - Advanced Swim Performance Engine v2.0")
+    print("="*70)
+    
+    # Initialize app with ensemble
+    print("\n⚙️ Initializing system with 5-model ensemble...")
+    app = HydroPredictEliteApp(model_type='auto', n_ensemble=5)
+    
+    # Use provided swimmers_import.csv from repository instead of generating
+    print("\n📝 Using provided swimmers_import.csv in repository...")
+    generated_sample = False
+    sample_csv = str(Path(__file__).parent / 'swimmers_import.csv')
+    
+    # Load and train with event-specific models
+    print("\n🎯 Training with event-specific modeling...")
+    profiles = app.load_and_train(sample_csv, use_event_specific=True)
+    
+    # Save model
+    app.save_model("hydropredict_elite_model.pkl")
+    
+    # Analyze a specific athlete
+    print("\n🔬 Generating comprehensive performance certificate...")
+    test_athlete = profiles[0]
+    certificate = app.analyze_athlete(test_athlete)
+    
+    # Print certificate
+    app.report_generator.print_certificate(certificate)
+    
+    # Export to JSON
+    app.export_report(certificate, f"{test_athlete.name}_certificate.json")
+    
+    # Batch analysis example
+    print("\n📊 Batch analysis for all athletes...")
+    all_certificates = app.batch_analyze(profiles[:5])  # First 5 athletes
+    
+    # Show summary statistics
+    predicted_times = [c['performance_metrics']['predicted_time'] for c in all_certificates]
+    uncertainties = [c['model_confidence']['prediction_uncertainty'] for c in all_certificates]
+    
+    print(f"\n📈 Batch Summary:")
+    print(f"   Athletes analyzed: {len(all_certificates)}")
+    print(f"   Mean predicted time: {np.mean(predicted_times):.2f}s")
+    print(f"   Mean uncertainty: ±{np.mean(uncertainties):.3f}s")
+    
+    # Demonstrate model loading
+    print("\n🔄 Demonstrating model persistence...")
+    new_app = HydroPredictEliteApp()
+    new_app.load_model("hydropredict_elite_model.pkl")
+    
+    # Verify loaded model works
+    test_certificate = new_app.analyze_athlete(test_athlete)
+    print(f"✅ Loaded model prediction: {test_certificate['performance_metrics']['predicted_time']:.2f}s")
+    
+    # Cleanup (only remove if we generated a temporary sample file)
+    if 'generated_sample' in locals() and generated_sample:
+        os.unlink(sample_csv)
+    
+    print("\n" + "="*70)
+    print("✅ HydroPredict Elite demonstration complete!")
+    print("="*70)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+def main():
+    """Enhanced example demonstrating all advanced features"""
+    print("="*70)
+    print("🚀 HYDROPREDICT ELITE - Advanced Swim Performance Engine v2.0")
+    print("="*70)
+    
+    # Initialize app with ensemble
+    print("\n⚙️ Initializing system with 5-model ensemble...")
+    app = HydroPredictEliteApp(model_type='auto', n_ensemble=5)
+    
+    # Create enhanced sample data
+    print("\n📝 Creating enhanced sample dataset...")
+    sample_csv = create_enhanced_sample_data()
+    
+    # Load and train with event-specific models
+    print("\n🎯 Training with event-specific modeling...")
+    profiles = app.load_and_train(sample_csv, use_event_specific=True)
+    
+    # Save model
+    app.save_model("hydropredict_elite_model.pkl")
+    
+    # Analyze a specific athlete
+    print("\n🔬 Generating comprehensive performance certificate...")
+    test_athlete = profiles[0]
+    certificate = app.analyze_athlete(test_athlete)
+    
+    # Print certificate
+    app.report_generator.print_certificate(certificate)
+    
+    # Export to JSON
+    app.export_report(certificate, f"{test_athlete.name}_certificate.json")
+    
+    # Batch analysis example
+    print("\n📊 Batch analysis for all athletes...")
+    all_certificates = app.batch_analyze(profiles[:5])  # First 5 athletes
+    
+    # Show summary statistics
+    predicted_times = [c['performance_metrics']['predicted_time'] for c in all_certificates]
+    uncertainties = [c['model_confidence']['prediction_uncertainty'] for c in all_certificates]
+    
+    print(f"\n📈 Batch Summary:")
+    print(f"   Athletes analyzed: {len(all_certificates)}")
+    print(f"   Mean predicted time: {np.mean(predicted_times):.2f}s")
+    print(f"   Mean uncertainty: ±{np.mean(uncertainties):.3f}s")
+    
+    # Demonstrate model loading
+    print("\n🔄 Demonstrating model persistence...")
+    new_app = HydroPredictEliteApp()
+    new_app.load_model("hydropredict_elite_model.pkl")
+    
+    # Verify loaded model works
+    test_certificate = new_app.analyze_athlete(test_athlete)
+    print(f"✅ Loaded model prediction: {test_certificate['performance_metrics']['predicted_time']:.2f}s")
+    
+    # Cleanup
+    os.unlink(sample_csv)
+    
+    print("\n" + "="*70)
+    print("✅ HydroPredict Elite demonstration complete!")
+    print("="*70)
+
+
+if __name__ == "__main__":
+    main()
