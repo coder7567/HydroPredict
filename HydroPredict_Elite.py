@@ -3,6 +3,7 @@ HydroPredict Elite: High-Fidelity Swim Performance Engine with Advanced Sports S
 Version 2.0 - Production-ready with proper modeling rigor
 """
 
+
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Tuple, Optional, Union, Any
@@ -320,14 +321,20 @@ class EnsembleModel(ABC):
         self.feature_names = None
         
     def fit(self, X: np.ndarray, y: np.ndarray):
-        """Fit ensemble with different random seeds"""
+        """Fit ensemble with bootstrap resampling for diversity"""
         self.models = []
-        
+        rng = np.random.RandomState(42)
+
+        n = X.shape[0]
+
         for i in range(self.n_estimators):
+            # Bootstrap sample (sample with replacement)
+            idx = rng.randint(0, n, size=n)
+
             model = ModelFactory.create_model(self.model_type, random_state=42 + i)
-            model.fit(X, y)
+            model.fit(X[idx], y[idx])
             self.models.append(model)
-        
+
         self.is_fitted = True
         
     def predict(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -675,67 +682,62 @@ class EnhancedSwimPredictor:
         # Event-specific models
         self.event_models = {}
         
-    def train(self, profiles: List[SwimmerProfile], 
-              use_event_specific: bool = True,
-              target: str = 'target_time'):
-        """Train with option for event-specific models"""
-        
-        # Group by event category if requested
+    def train(self, profiles: List[SwimmerProfile], use_event_specific: bool = True, target: str = 'target_time'):
+
+        self.event_models = {}
+
         if use_event_specific:
             event_groups = {}
             for p in profiles:
-                if p.event_category not in event_groups:
-                    event_groups[p.event_category] = []
-                event_groups[p.event_category].append(p)
-            
-            # Train one model per event category
+                event_groups.setdefault(p.event_category, []).append(p)
+
             for category, cat_profiles in event_groups.items():
-                if len(cat_profiles) >= 10:  # Minimum samples threshold
-                    model = self._train_single(cat_profiles, target)
-                    self.event_models[category] = model
+                if len(cat_profiles) >= 10:
+                    self.event_models[category] = self._train_single(cat_profiles, target)
                 else:
-                    # Fall back to general model for small categories
                     warnings.warn(f"Category {category} has only {len(cat_profiles)} samples, using general model")
-        
-        # Always train general model
-        self._train_single(profiles, target)
-        
+
+        # Train + STORE the general model bundle
+        general = self._train_single(profiles, target)
+        self.ensemble = general["ensemble"]
+        self.feature_pipeline = general["pipeline"]
+        self.training_history = general["training_history"]
+        self.feature_importance = general["feature_importance"]
+
         self.training_timestamp = datetime.now()
         return self.training_history
     
     def _train_single(self, profiles: List[SwimmerProfile], target: str):
-        """Train a single model on given profiles"""
-        
-        # Prepare features
-        self.feature_pipeline.fit(profiles)
-        X = self.feature_pipeline.transform(profiles)
+        pipeline = AdvancedFeaturePipeline().fit(profiles)
+        X = pipeline.transform(profiles)
         y = np.array([getattr(p, target) for p in profiles])
-        
-        # Train/validation split
+
         X_train, X_val, y_train, y_val = train_test_split(
             X, y, test_size=0.2, random_state=42
         )
-        
-        # Train ensemble
-        self.ensemble.feature_names = self.feature_pipeline.feature_names
-        self.ensemble.fit(X_train, y_train)
-        
-        # Validate
-        y_pred, uncertainty = self.ensemble.predict(X_val)
-        
-        # Store metrics
-        self.training_history = {
+
+        ensemble = EnsembleModel(n_estimators=self.ensemble.n_estimators, model_type=self.ensemble.model_type)
+        ensemble.feature_names = pipeline.feature_names
+        ensemble.fit(X_train, y_train)
+
+        y_pred, uncertainty = ensemble.predict(X_val)
+
+        training_history = {
             'mae': mean_absolute_error(y_val, y_pred),
             'rmse': np.sqrt(mean_squared_error(y_val, y_pred)),
             'r2': r2_score(y_val, y_pred),
-            'mean_uncertainty': np.mean(uncertainty),
+            'mean_uncertainty': float(np.mean(uncertainty)),
             'n_samples': len(profiles)
         }
-        
-        # Calculate feature importance using validation set
-        self.feature_importance = self.ensemble.feature_importance(X_val, y_val)
-        
-        return self.ensemble
+
+        feature_importance = ensemble.feature_importance(X_val, y_val)
+
+        return {
+            "ensemble": ensemble,
+            "pipeline": pipeline,
+            "training_history": training_history,
+            "feature_importance": feature_importance
+        }
     
     def predict(self, profile: SwimmerProfile) -> Tuple[float, float]:
         """
@@ -748,10 +750,11 @@ class EnhancedSwimPredictor:
         
         # Try event-specific model first
         if profile.event_category in self.event_models:
-            model = self.event_models[profile.event_category]
-            # Need to ensure feature pipeline matches
-            pred, unc = model.predict(X)
+            bundle = self.event_models[profile.event_category]
+            X = bundle["pipeline"].transform(profile)
+            pred, unc = bundle["ensemble"].predict(X)
         else:
+            X = self.feature_pipeline.transform(profile)
             pred, unc = self.ensemble.predict(X)
         
         return float(pred[0]), float(unc[0])
@@ -799,60 +802,89 @@ class AdvancedMonteCarloSimulator:
     def __init__(self, n_runs: int = 10000):
         self.n_runs = n_runs
         self.random_state = np.random.RandomState(42)
+
+    def physiological_limit_seconds(self, pred_time: float, profile: SwimmerProfile) -> float:
+        """
+        Absolute physiological limit (hard floor).
+        Returns the fastest humanly possible time for THIS profile.
+        """
+
+        # HRV bonus (higher HRV -> more upside), clamp 0..1
+        hrv_bonus = np.clip((profile.biometrics.hrv - 50.0) / 50.0, 0.0, 1.0)
+
+        # Technique bonus from efficiency score (0..1)
+        eff = profile.stroke.efficiency_score()
+        eff_bonus = np.clip(eff / 100.0, 0.0, 1.0)
+
+        # Fatigue penalty (fatigue_factor > 1 means tired); clamp 0..1
+        fatigue_penalty = np.clip((profile.training.fatigue_factor - 1.0) * 2.0, 0.0, 1.0)
+
+        # Improvement fraction: 3%..10% before fatigue penalty
+        improvement = 0.03 + 0.07 * (0.6 * hrv_bonus + 0.4 * eff_bonus)
+
+        # Fatigue reduces the achievable “best possible”
+        improvement *= (1.0 - 0.7 * fatigue_penalty)
+
+        # Safety clamp: never allow >12% improvement from prediction
+        improvement = float(np.clip(improvement, 0.01, 0.12))
+
+        return float(pred_time * (1.0 - improvement))
     
-    def simulate(self, base_prediction: float, 
-                 model_uncertainty: float,
-                 profile: SwimmerProfile) -> Dict[str, float]:
-        """
-        Run Monte Carlo simulation combining multiple uncertainty sources
-        
-        Args:
-            base_prediction: Model prediction
-            model_uncertainty: Epistemic uncertainty from ensemble
-            profile: Athlete profile for physiological factors
-        
-        Returns:
-            Dictionary with simulation statistics
-        """
-        
+    def simulate(self, base_prediction: float,
+                model_uncertainty: float,
+                profile: SwimmerProfile) -> Dict[str, float]:
         # Physiological variability (aleatoric)
-        physio_variance = 0.1 * (1 + (10 - profile.biometrics.hrv/10) / 10)  # HRV impacts variability
-        
+        physio_variance = 0.1 * (1 + (10 - profile.biometrics.hrv / 10) / 10)
+
         # Fatigue factor from ACWR
         fatigue_factor = profile.training.fatigue_factor
-        
+
         # Environmental uncertainty
         env_uncertainty = 0.05 if profile.environment.pool_type == PoolType.LCM else 0.08
-        
+
         # Combine all uncertainties
         total_std = np.sqrt(
-            model_uncertainty**2 + 
-            physio_variance**2 + 
+            model_uncertainty**2 +
+            physio_variance**2 +
             env_uncertainty**2
         ) * fatigue_factor
-        
-        # Generate simulations
-        simulations = self.random_state.normal(
-            base_prediction, 
-            total_std, 
+
+        # Absolute physiological limit (hard floor)
+        absolute_limit = self.physiological_limit_seconds(base_prediction, profile)
+
+        # "Perfect storm" shift
+        perfect_day_shift = 0.25 * total_std
+
+        # Draw RAW simulations first (unclamped)
+        raw = self.random_state.normal(
+            base_prediction - perfect_day_shift,
+            total_std,
             self.n_runs
         )
-        
-        # Apply physiological constraints (can't go below theoretical limit)
-        theoretical_limit = base_prediction * 0.92  # 8% improvement max
-        simulations = np.maximum(simulations, theoretical_limit)
-        
-        return {
-            'expected': float(np.mean(simulations)),
-            'hard_cap': float(np.percentile(simulations, 1)),
-            'panic_threshold': float(np.percentile(simulations, 90)),
-            'consistency': float(np.std(simulations)),
-            'coefficient_of_variation': float(np.std(simulations) / np.mean(simulations)),
-            'confidence_95_lower': float(np.percentile(simulations, 2.5)),
-            'confidence_95_upper': float(np.percentile(simulations, 97.5)),
-            'simulations': simulations.tolist()
-        }
 
+        # Perfect storm from RAW distribution (rare best-case)
+        perfect_storm = float(np.percentile(raw, 5.0))   # or 2.5
+
+        # Clamp to hard floor for final outcomes
+        ci_raw_low  = float(np.percentile(raw, 2.5))
+        ci_raw_high = float(np.percentile(raw, 97.5))
+        simulations = np.maximum(raw, absolute_limit)
+
+        return {
+            "expected": float(np.mean(simulations)),
+
+            "absolute_physiological_limit": float(absolute_limit),
+
+            # perfect storm can't beat the hard floor
+            "perfect_storm_time": float(max(perfect_storm, absolute_limit)),
+
+            "panic_threshold": float(np.percentile(simulations, 90)),
+            "consistency": float(np.std(simulations)),
+            "coefficient_of_variation": float(np.std(simulations) / np.mean(simulations)),
+            "confidence_95_lower": float(np.percentile(simulations, 2.5)),
+            "confidence_95_upper": float(np.percentile(simulations, 97.5)),
+            "simulations": simulations.tolist()
+        }
 
 # =============================================================================
 # Comprehensive Report Generator
@@ -885,11 +917,20 @@ class ComprehensiveReportGenerator:
         # Cognitive metrics
         cognitive_load = profile.cognitive.cognitive_load_index
         
-        # Physiological red-zone threshold based on HR and lactate
-        hr_threshold = 180 - profile.biometrics.resting_hr * 0.5
-        lactate_threshold = profile.biometrics.blood_lactate or 4.0
-        red_zone_factor = 1 + (hr_threshold - 160) / 400 + (lactate_threshold - 4) / 20
-        red_zone_threshold = pred_time * red_zone_factor
+        # Red-zone = "blow-up risk time" (ALWAYS slower than predicted)
+        lactate = profile.biometrics.blood_lactate if profile.biometrics.blood_lactate is not None else 4.0
+        anxiety = profile.cognitive.pre_race_anxiety  # 1..10
+        fatigue = profile.training.fatigue_factor     # ~0.95..1.2+
+
+        slowdown = (
+            0.02 +                           # base 2% slower
+            0.01  * max(0.0, lactate - 4.0) +# lactate above 4 adds slowdown
+            0.003 * max(0.0, anxiety - 5.0) +# anxiety above 5 adds slowdown
+            0.04  * max(0.0, fatigue - 1.0)  # fatigue above 1 adds slowdown
+        )
+
+        slowdown = float(np.clip(slowdown, 0.02, 0.20))  # 2%..20% slower cap
+        red_zone_threshold = pred_time * (1.0 + slowdown)
         
         # Feature importance
         feature_importance = self.predictor.get_feature_importance()
@@ -921,7 +962,8 @@ class ComprehensiveReportGenerator:
                 'previous_best': profile.previous_best_time,
                 'target_time': profile.target_time,
                 'improvement_potential': ((profile.previous_best_time - pred_time) / profile.previous_best_time) * 100,
-                'physiological_hard_cap': simulation_results['hard_cap'],
+                'absolute_physiological_limit': simulation_results['absolute_physiological_limit'],
+                'perfect_storm_time': simulation_results['perfect_storm_time'],
                 'red_zone_threshold': red_zone_threshold,
                 'efficiency_score': efficiency_score,
                 'cognitive_load_index': cognitive_load
@@ -1008,7 +1050,8 @@ class ComprehensiveReportGenerator:
         print(f"   Predicted Time: {certificate['performance_metrics']['predicted_time']:.2f}s")
         print(f"   Previous Best: {certificate['performance_metrics']['previous_best']:.2f}s")
         print(f"   Improvement: {certificate['performance_metrics']['improvement_potential']:.1f}%")
-        print(f"   🧱 Theoretical Hard Cap: {certificate['performance_metrics']['physiological_hard_cap']:.2f}s")
+        print(f"   🧱 Absolute Physiological Limit: {certificate['performance_metrics']['absolute_physiological_limit']:.2f}s")
+        print(f"   ⚡ Perfect Storm Scenario:      {certificate['performance_metrics']['perfect_storm_time']:.2f}s")
         print(f"   🔴 Red-Zone Threshold: {certificate['performance_metrics']['red_zone_threshold']:.2f}s")
         
         print(f"\n⚙️ EFFICIENCY ANALYSIS:")
