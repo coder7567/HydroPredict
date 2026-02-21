@@ -137,3 +137,94 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def create_enhanced_sample_data() -> str:
+    """Create enhanced sample CSV with dynamic column prefixes"""
+    import tempfile
+    
+    # Generate 50 sample athletes with realistic variation
+    np.random.seed(42)
+    n_samples = 50
+    
+    data = {
+        'name': [f"Athlete_{i}" for i in range(n_samples)],
+        'event': np.random.choice(
+            ['50m Free', '100m Free', '200m Free', '400m Free', '200m IM'],
+            n_samples
+        ),
+        'previous_best_time': np.random.normal(55, 5, n_samples),
+        'target_time': np.random.normal(54, 5, n_samples),
+        
+        # Biometrics with bio_ prefix
+        'bio_hrv': np.random.normal(65, 10, n_samples),
+        'bio_resting_hr': np.random.normal(50, 5, n_samples),
+        'bio_sleep_hours': np.random.normal(8, 1, n_samples),
+        'bio_sleep_quality': np.random.normal(80, 10, n_samples),
+        'bio_muscle_soreness': np.random.uniform(1, 10, n_samples),
+        'bio_body_mass': np.random.normal(75, 8, n_samples),
+        'bio_hydration_estimate': np.random.normal(95, 3, n_samples),
+        'bio_blood_lactate': np.random.exponential(2, n_samples),
+        
+        # Environment with env_ prefix
+        'env_water_temp': np.random.normal(27.5, 1, n_samples),
+        'env_air_temp': np.random.normal(24, 2, n_samples),
+        'env_humidity': np.random.normal(55, 10, n_samples),
+        'env_pressure': np.random.normal(1013, 5, n_samples),
+        'env_altitude': np.random.choice([0, 500, 1000], n_samples),
+        'env_lane_number': np.random.randint(1, 9, n_samples),
+        'env_pool_type': np.random.choice(['LCM', 'SCM', 'SCY'], n_samples),
+        
+        # Stroke metrics with stroke_ prefix
+        'stroke_stroke_rate': np.random.normal(55, 8, n_samples),
+        'stroke_stroke_length': np.random.normal(2.1, 0.3, n_samples),
+        'stroke_distance_per_stroke': np.random.normal(2.0, 0.3, n_samples),
+        'stroke_turn_time': np.random.normal(0.8, 0.2, n_samples),
+        'stroke_underwater_distance': np.random.normal(12, 3, n_samples),
+        'stroke_intra_cycle_velocity_fluctuation': np.random.exponential(0.15, n_samples),
+        
+        # Cognitive with cog_ prefix
+        'cog_stress_level': np.random.uniform(1, 10, n_samples),
+        'cog_screen_time': np.random.exponential(3, n_samples),
+        'cog_gaming_hours': np.random.exponential(1, n_samples),
+        'cog_focus_rating': np.random.uniform(1, 10, n_samples),
+        'cog_pre_race_anxiety': np.random.uniform(1, 10, n_samples),
+        
+        # Training with train_ prefix
+        'train_acute_load': np.random.normal(800, 200, n_samples),
+        'train_chronic_load': np.random.normal(750, 150, n_samples),
+        'train_weekly_yardage': np.random.normal(35000, 5000, n_samples),
+        'train_training_stress_balance': np.random.normal(0, 3, n_samples)
+    }
+    
+    df = pd.DataFrame(data)
+    
+    temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False)
+    df.to_csv(temp_file.name, index=False)
+    temp_file.close()
+    
+    return temp_file.name
