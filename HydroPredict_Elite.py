@@ -318,6 +318,56 @@ class EnsembleModel(ABC):
         self.is_fitted = False
         self.feature_names = None
 
+    def feature_importance_seconds(
+        self,
+        X_val: np.ndarray,
+        profiles_val: List[Any],   # SwimmerProfile list
+        y_val_native: np.ndarray,  # pct/delta/absolute labels for those profiles
+        target_type: str
+    ) -> Dict[str, float]:
+        """
+        Permutation importance measured by seconds-space MAE, even if model was trained on pct/delta.
+        """
+        if not self.is_fitted or not self.models:
+            raise ValueError("Ensemble must be fitted before computing importance")
+
+        if self.feature_names is None:
+            self.feature_names = [f"f{i}" for i in range(X_val.shape[1])]
+
+        # Helper: convert native -> seconds for given profiles
+        prev = np.asarray([p.previous_best_time for p in profiles_val], dtype=float)
+
+        if len(prev) != len(y_val_native):
+            raise ValueError(f"profiles_val length {len(prev)} != y_val_native length {len(y_val_native)}")
+
+        def native_to_seconds(arr_native: np.ndarray) -> np.ndarray:
+            if target_type in ("target_time", "absolute"):
+                return arr_native
+            if target_type == "delta":
+                return prev + arr_native
+            if target_type in ("pct", "pct_impr"):
+                return prev * (1.0 + arr_native)
+            return arr_native
+
+        base_pred_native = self.models[0].predict(X_val)
+        base_pred_sec = native_to_seconds(base_pred_native)
+        true_sec = native_to_seconds(np.asarray(y_val_native, dtype=float))
+
+        base_mae = np.mean(np.abs(base_pred_sec - true_sec))
+
+        importances = []
+        rng = np.random.RandomState(42)
+
+        for j in range(X_val.shape[1]):
+            Xp = X_val.copy()
+            rng.shuffle(Xp[:, j])
+            pred_native = self.models[0].predict(Xp)
+            pred_sec = native_to_seconds(pred_native)
+            mae = np.mean(np.abs(pred_sec - true_sec))
+            importances.append(mae - base_mae)  # MAE increase = importance
+
+        return dict(zip(self.feature_names, importances))
+
     def feature_importance(self, X_val: np.ndarray, y_val: np.ndarray) -> Dict[str, float]:
         """
         Permutation importance using the first base model in the ensemble.
@@ -890,20 +940,28 @@ class EnhancedSwimPredictor:
         # Compute feature importance on full data using permutation on a held-out split if possible
         feature_importance = {}
         try:
-            # If we have at least 10 samples, compute importances on a small holdout
             if len(profiles) >= 10:
-                X_tr, X_va, y_tr, y_va = train_test_split(X, y, test_size=0.2, random_state=42)
+                idx = np.arange(len(profiles))
+                idx_tr, idx_va = train_test_split(idx, test_size=0.2, random_state=42)
+
+                X_tr, X_va = X[idx_tr], X[idx_va]
+                y_tr, y_va = y[idx_tr], y[idx_va]
+                val_profiles = [profiles[i] for i in idx_va]  # ✅ aligned with X_va/y_va
+
                 imp_ensemble = EnsembleModel(
                     n_estimators=self.ensemble.n_estimators,
                     model_type=self.ensemble.model_type
                 )
                 imp_ensemble.feature_names = pipeline.feature_names
                 imp_ensemble.fit(X_tr, y_tr)
-                feature_importance = imp_ensemble.feature_importance(X_va, y_va)
+
+                feature_importance = imp_ensemble.feature_importance_seconds(
+                    X_va, val_profiles, y_va, target
+                )
             else:
-                # Fallback: use zero importances when insufficient data
                 feature_importance = {fn: 0.0 for fn in pipeline.feature_names}
-        except Exception:
+        except Exception as e:
+            print("⚠️ Feature importance failed:", repr(e))
             feature_importance = {fn: 0.0 for fn in pipeline.feature_names}
 
         return {
@@ -1528,6 +1586,48 @@ class HydroPredictEliteApp:
         """Analyze multiple athletes"""
         return [self.analyze_athlete(p) for p in profiles]
     
+    def choose_athlete(self, profiles):
+        """
+        Interactive selector for athlete profiles.
+        Returns a SwimmerProfile.
+        """
+        if not profiles:
+            raise ValueError("No profiles loaded.")
+
+        # Build a display list with indexes
+        print("\n🧾 Available athletes:")
+        for i, p in enumerate(profiles, 1):
+            pool = getattr(p.environment.pool_type, "value", str(p.environment.pool_type))
+            print(f"  {i:3d}) {p.name:25s} | {p.event:12s} | {pool}")
+
+        while True:
+            raw = input("\nPick an athlete by number OR type part of a name: ").strip()
+
+            # If number selection
+            if raw.isdigit():
+                idx = int(raw)
+                if 1 <= idx <= len(profiles):
+                    return profiles[idx - 1]
+                print(f"❌ Number out of range (1..{len(profiles)})")
+                continue
+
+            # Name search selection (partial match)
+            q = raw.lower()
+            matches = [p for p in profiles if q in p.name.lower()]
+            if len(matches) == 1:
+                return matches[0]
+            elif len(matches) > 1:
+                print("\n🔎 Multiple matches:")
+                for i, p in enumerate(matches, 1):
+                    pool = getattr(p.environment.pool_type, "value", str(p.environment.pool_type))
+                    print(f"  {i:2d}) {p.name:25s} | {p.event:12s} | {pool}")
+                pick = input("Pick match number: ").strip()
+                if pick.isdigit() and 1 <= int(pick) <= len(matches):
+                    return matches[int(pick) - 1]
+                print("❌ Invalid match pick.")
+            else:
+                print("❌ No matches. Try again.")
+    
     def export_report(self, certificate: Dict, filepath: str):
         """Export certificate to JSON with proper serialization"""
         
@@ -1816,7 +1916,7 @@ def main():
     
     # Analyze a specific athlete
     print("\n🔬 Generating comprehensive performance certificate...")
-    test_athlete = test_profiles[0]
+    test_athlete = app.choose_athlete(profiles)
     certificate = app.analyze_athlete(test_athlete)
     
     # Print certificate
