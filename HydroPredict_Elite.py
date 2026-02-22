@@ -26,7 +26,7 @@ except ImportError:
     warnings.warn("XGBoost not available, falling back to sklearn models")
 
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split, KFold
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.inspection import permutation_importance
@@ -311,60 +311,56 @@ class SwimmerProfile:
 # =============================================================================
 
 class EnsembleModel(ABC):
-    """Ensemble of models for uncertainty estimation"""
-    
     def __init__(self, n_estimators: int = 5, model_type: str = 'auto'):
         self.n_estimators = n_estimators
         self.models = []
         self.model_type = model_type
         self.is_fitted = False
         self.feature_names = None
-        
+
+    def feature_importance(self, X_val: np.ndarray, y_val: np.ndarray) -> Dict[str, float]:
+        """
+        Permutation importance using the first base model in the ensemble.
+        Returns dict: feature_name -> importance
+        """
+        if not self.is_fitted or not self.models:
+            raise ValueError("Ensemble must be fitted before computing importance")
+
+        if self.feature_names is None:
+            # fallback names if none provided
+            self.feature_names = [f"f{i}" for i in range(X_val.shape[1])]
+
+        r = permutation_importance(
+            self.models[0],
+            X_val,
+            y_val,
+            n_repeats=10,
+            random_state=42,
+            n_jobs=-1
+        )
+        return dict(zip(self.feature_names, r.importances_mean))
+
     def fit(self, X: np.ndarray, y: np.ndarray):
-        """Fit ensemble with bootstrap resampling for diversity"""
         self.models = []
         rng = np.random.RandomState(42)
-
         n = X.shape[0]
 
         for i in range(self.n_estimators):
-            # Bootstrap sample (sample with replacement)
             idx = rng.randint(0, n, size=n)
-
             model = ModelFactory.create_model(self.model_type, random_state=42 + i)
             model.fit(X[idx], y[idx])
             self.models.append(model)
 
         self.is_fitted = True
-        
+
     def predict(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Returns:
-            mean_predictions: Average of all models
-            uncertainty: Standard deviation across models (epistemic uncertainty)
-        """
         if not self.is_fitted:
             raise ValueError("Model must be fitted before prediction")
-        
-        all_predictions = np.array([model.predict(X) for model in self.models])
-        mean_pred = np.mean(all_predictions, axis=0)
-        uncertainty = np.std(all_predictions, axis=0)
-        
-        return mean_pred, uncertainty
-    
-    def feature_importance(self, X_val: np.ndarray, y_val: np.ndarray) -> Dict[str, float]:
-        """Calculate permutation importance using validation set"""
-        if not self.feature_names:
-            raise ValueError("Feature names must be set")
-        
-        # Use first model for importance (ensemble would be too expensive)
-        result = permutation_importance(
-            self.models[0], X_val, y_val,
-            n_repeats=10, random_state=42, n_jobs=-1
-        )
-        
-        return dict(zip(self.feature_names, result.importances_mean))
 
+        all_preds = np.array([m.predict(X) for m in self.models])  # (n_models, n_samples)
+        mean_pred = np.mean(all_preds, axis=0)
+        unc = np.std(all_preds, axis=0)
+        return mean_pred, unc
 
 class ModelFactory:
     """Factory for creating appropriate model instances"""
@@ -435,17 +431,21 @@ class DynamicDataIngestionPipeline:
             return json.load(f)
     
     def load_from_csv(self, filepath: str) -> List[SwimmerProfile]:
-        """Load and parse CSV with dynamic column mapping"""
         df = pd.read_csv(filepath)
-        
-        # Detect column types based on prefixes
+
+        ALIASES = {
+            "env_pressure": "env_barometric_pressure",
+            "bio_hydration": "bio_hydration_estimate",
+        }
+        df = df.rename(columns=ALIASES)
+
         column_mapping = self._map_columns(df.columns)
-        
+
         profiles = []
         for _, row in df.iterrows():
             profile = self._row_to_profile(row, column_mapping)
             profiles.append(profile)
-        
+
         return profiles
     
     def _map_columns(self, columns: List[str]) -> Dict:
@@ -473,53 +473,64 @@ class DynamicDataIngestionPipeline:
         return mapping
     
     def _row_to_profile(self, row: pd.Series, mapping: Dict) -> SwimmerProfile:
-        """Convert DataFrame row to SwimmerProfile using mapping"""
         
         # Core fields
         name = row.get('name', 'Unknown')
         event = row.get('event', 'Unknown')
         previous_best = float(row.get('previous_best_time', row.get('last_time', 0)))
         target = float(row.get('target_time', previous_best * 0.98))  # Default 2% improvement
-        
+
+        # ✅ OPTION B: keep times native. Only parse pool type.
+        pool_raw = row.get('env_pool_type', None)
+        if pool_raw is not None:
+            try:
+                pool_enum = PoolType(str(pool_raw).strip())
+            except Exception:
+                pool_enum = PoolType.LCM
+        else:
+            pool_enum = PoolType.LCM
+
         # Biometrics
         bio_kwargs = self._extract_prefix_fields(row, 'bio_', {
             'hrv': 65, 'resting_hr': 50, 'sleep_hours': 8, 'sleep_quality': 80,
             'muscle_soreness': 3, 'body_mass': 70, 'hydration_estimate': 95, 'blood_lactate': None
         })
         biometrics = BioMetrics(**bio_kwargs)
-        
+
         # Environment
         env_kwargs = self._extract_prefix_fields(row, 'env_', {
             'water_temp': 27.5, 'air_temp': 24.0, 'humidity': 55,
             'barometric_pressure': 1013, 'altitude': 0, 'lane_number': 4,
-            'pool_type': PoolType.LCM
+            'pool_type': pool_enum  # ✅ keep actual pool type
         })
-        # Convert pool_type string to Enum
+
+        # Convert pool_type string to Enum if needed
         if isinstance(env_kwargs.get('pool_type'), str):
             env_kwargs['pool_type'] = PoolType(env_kwargs['pool_type'])
+
         environment = Environment(**env_kwargs)
-        
+
         # Stroke
         stroke_kwargs = self._extract_prefix_fields(row, 'stroke_', {
             'stroke_rate': 55, 'stroke_length': 2.1, 'distance_per_stroke': 2.0,
             'turn_time': 0.8, 'underwater_distance': 12, 'intra_cycle_velocity_fluctuation': 0.15
         })
         stroke = StrokeModel(**stroke_kwargs)
-        
+
         # Cognitive
         cog_kwargs = self._extract_prefix_fields(row, 'cog_', {
             'stress_level': 4, 'screen_time': 3, 'gaming_hours': 1,
             'focus_rating': 7, 'pre_race_anxiety': 4
         })
         cognitive = CognitiveMetrics(**cog_kwargs)
-        
+
         # Training
         train_kwargs = self._extract_prefix_fields(row, 'train_', {
             'acute_load': 800, 'chronic_load': 750, 'weekly_yardage': 35000,
             'training_stress_balance': 0
         })
         training = TrainingLoad(**train_kwargs)
-        
+
         return SwimmerProfile(
             name=name,
             event=event,
@@ -543,40 +554,82 @@ class DynamicDataIngestionPipeline:
                 result[field] = default
         return result
 
+    def _convert_time_to_lcm(self, time_sec: float, pool_type: PoolType, event: str) -> float:
+        """Approximate conversion of times in seconds from SCY/SCM to LCM-equivalent.
+
+        This uses conservative, distance-aware multipliers to normalize times into
+        a long-course-meter (LCM) scale for modeling consistency.
+        """
+        if pool_type == PoolType.LCM:
+            return float(time_sec)
+
+        # Base multipliers
+        if pool_type == PoolType.SCM:
+            mul = 1.02
+        elif pool_type == PoolType.SCY:
+            mul = 1.11
+        else:
+            mul = 1.0
+
+        # Adjust slightly by event distance (sprints vs distance)
+        try:
+            import re
+            m = re.search(r"(\d{2,4})", str(event))
+            dist = int(m.group(1)) if m else None
+        except Exception:
+            dist = None
+
+        if dist is not None:
+            if dist <= 100:
+                if pool_type == PoolType.SCY:
+                    mul = 1.09
+                elif pool_type == PoolType.SCM:
+                    mul = 1.015
+            elif dist >= 800:
+                if pool_type == PoolType.SCY:
+                    mul = 1.14
+                elif pool_type == PoolType.SCM:
+                    mul = 1.03
+
+        return float(time_sec * mul)
+
 
 class AdvancedFeaturePipeline:
     """Feature engineering with dynamic normalization and event grouping"""
+    EVENT_CAT_MAP = {
+        "SPRINT": 0,
+        "MID_DISTANCE": 1,
+        "DISTANCE": 2,
+        "IM": 3,
+        "OTHER": 4
+    }
     
     def __init__(self):
         self.scaler = StandardScaler()
         self.normalizers = {}  # For percentile-based normalization
         self.feature_names = []
-        self.event_encoders = {}
         self.is_fitted = False
         
     def fit(self, profiles: List[SwimmerProfile]):
-        """Calculate normalization parameters from training data"""
-        
-        # Calculate percentiles for dynamic normalization
+        # 1) compute normalizers first
         self._calculate_normalizers(profiles)
-        
-        # Transform and fit scaler
-        X = self._profiles_to_matrix(profiles)
+
+        # 2) build X USING those normalizers
+        X = self._profiles_to_matrix(profiles, use_normalizers=True)
+
         self.feature_names = self._generate_feature_names()
         self.scaler.fit(X)
         self.is_fitted = True
-        
         return self
     
     def transform(self, profiles: Union[SwimmerProfile, List[SwimmerProfile]]) -> np.ndarray:
-        """Transform profiles using fitted parameters"""
         if not self.is_fitted:
             raise ValueError("Pipeline must be fitted before transform")
-        
+
         if isinstance(profiles, SwimmerProfile):
             profiles = [profiles]
-        
-        X = self._profiles_to_matrix(profiles)
+
+        X = self._profiles_to_matrix(profiles, use_normalizers=True)
         return self.scaler.transform(X)
     
     def _calculate_normalizers(self, profiles: List[SwimmerProfile]):
@@ -628,14 +681,12 @@ class AdvancedFeaturePipeline:
                     np.percentile(values, 95)
                 )
     
-    def _profiles_to_matrix(self, profiles: List[SwimmerProfile]) -> np.ndarray:
-        """Convert list of profiles to feature matrix with normalization"""
+    def _profiles_to_matrix(self, profiles: List[SwimmerProfile], use_normalizers: bool) -> np.ndarray:
         matrices = []
+        bio_norm = self.normalizers.get('bio', {}) if use_normalizers else None
+        stroke_norm = self.normalizers.get('stroke', {}) if use_normalizers else None
+
         for p in profiles:
-            # Use normalizers if available
-            bio_norm = self.normalizers.get('bio') if self.is_fitted else None
-            stroke_norm = self.normalizers.get('stroke') if self.is_fitted else None
-            
             features = np.concatenate([
                 [p.previous_best_time],
                 p.biometrics.to_feature_vector(bio_norm),
@@ -643,25 +694,33 @@ class AdvancedFeaturePipeline:
                 p.stroke.to_feature_vector(stroke_norm),
                 p.cognitive.to_feature_vector(),
                 p.training.to_feature_vector(),
-                [hash(p.event_category) % 100]
+                [
+                    self.EVENT_CAT_MAP.get(p.event_category, 4)
+                ]
             ])
             matrices.append(features)
-        
+
         return np.array(matrices)
     
     def _generate_feature_names(self) -> List[str]:
         """Generate feature names for interpretability"""
         return [
             'previous_best_time',
-            'hrv', 'resting_hr', 'sleep_hours', 'sleep_quality', 
+            # Biometrics
+            'hrv', 'resting_hr', 'sleep_hours', 'sleep_quality',
             'muscle_soreness', 'body_mass', 'hydration', 'lactate',
-            'water_temp', 'air_temp', 'humidity', 'pressure', 
-            'altitude', 'lane', 'pool_type',
+            # Environment
+            'water_temp', 'air_temp', 'humidity', 'barometric_pressure',
+            'altitude', 'lane_number', 'pool_type',
+            # Stroke
             'stroke_rate', 'stroke_length', 'distance_per_stroke',
             'turn_time', 'underwater_distance', 'icvf',
-            'stress', 'screen_time', 'gaming_hours', 'focus', 'anxiety',
-            'acute_load', 'chronic_load', 'acwr', 'weekly_yardage', 'tsb',
-            'event_category'
+            # Cognitive
+            'stress_level', 'screen_time', 'gaming_hours', 'focus_rating', 'pre_race_anxiety',
+            # Training
+            'acute_load', 'chronic_load', 'acwr', 'weekly_yardage', 'training_stress_balance',
+            # Encoded category
+            'event_category_encoded'
         ]
 
 
@@ -678,14 +737,39 @@ class EnhancedSwimPredictor:
         self.training_history = {}
         self.model_version = "2.0.0"
         self.training_timestamp = None
+        self.target_type = 'target_time'  # 'target_time' | 'delta' | 'pct'
         
         # Event-specific models
         self.event_models = {}
+        # Pool-specific models (keys are PoolType)
+        self.pool_models = {}
+        self.pool_model_quality = {}  # PoolType -> dict(metrics + gate decision)
+        self.use_pool_gating = True   # enable gating by default
+        self.pool_gate_margin_pct = 0.02 # Only use pool-specific model if it shows at least this much improvement in MAE (percent) during CV
+
+    def get_feature_importance(self) -> Dict[str, float]:
+        """Return stored feature importance dict (may be empty if not computed)."""
+        fi = getattr(self, "feature_importance", None)
+        return fi if isinstance(fi, dict) else {}
         
-    def train(self, profiles: List[SwimmerProfile], use_event_specific: bool = True, target: str = 'target_time'):
+    def train(self, profiles: List[SwimmerProfile], use_event_specific: bool = True, use_pool_specific: bool = True, target: str = 'target_time'):
 
         self.event_models = {}
+        self.pool_models = {}
+        self.pool_model_quality = {}
+        # remember how we trained (absolute target, delta, or percent)
+        self.target_type = target
+        # Fit one shared preprocessing pipeline across all model variants
+        self.feature_pipeline = AdvancedFeaturePipeline().fit(profiles)
 
+        # (1) Train GENERAL FIRST so gating can compare against it
+        general = self._train_single(profiles, target, pipeline=self.feature_pipeline)
+        self.ensemble = general["ensemble"]
+        self.feature_pipeline = general["pipeline"]
+        self.training_history = general["training_history"]
+        self.feature_importance = general["feature_importance"]
+
+        # (2) Event-specific models (optional)
         if use_event_specific:
             event_groups = {}
             for p in profiles:
@@ -693,78 +777,349 @@ class EnhancedSwimPredictor:
 
             for category, cat_profiles in event_groups.items():
                 if len(cat_profiles) >= 10:
-                    self.event_models[category] = self._train_single(cat_profiles, target)
+                    self.event_models[category] = self._train_single(
+                        cat_profiles,
+                        target,
+                        pipeline=self.feature_pipeline
+                    )
                 else:
                     warnings.warn(f"Category {category} has only {len(cat_profiles)} samples, using general model")
 
-        # Train + STORE the general model bundle
-        general = self._train_single(profiles, target)
-        self.ensemble = general["ensemble"]
-        self.feature_pipeline = general["pipeline"]
-        self.training_history = general["training_history"]
-        self.feature_importance = general["feature_importance"]
+        # (3) Pool-specific models WITH gating (optional)
+        if use_pool_specific:
+            pool_groups = {}
+            for p in profiles:
+                pool_groups.setdefault(p.environment.pool_type, []).append(p)
+
+            for pool_type, pool_profiles in pool_groups.items():
+                if len(pool_profiles) >= 10:
+                    bundle, q = self._train_pool_model_with_gate(
+                        pool_profiles,
+                        target,
+                        pipeline=self.feature_pipeline
+                    )
+                    self.pool_models[pool_type] = bundle
+                    self.pool_model_quality[pool_type] = q
+                else:
+                    self.pool_model_quality[pool_type] = {
+                        "n": len(pool_profiles),
+                        "use_pool_model": False,
+                        "reason": "too_few_samples"
+                    }
 
         self.training_timestamp = datetime.now()
         return self.training_history
     
-    def _train_single(self, profiles: List[SwimmerProfile], target: str):
-        pipeline = AdvancedFeaturePipeline().fit(profiles)
+    def _train_single(
+        self,
+        profiles: List[SwimmerProfile],
+        target: str,
+        pipeline: Optional[AdvancedFeaturePipeline] = None
+    ):
+        # Use caller-provided shared pipeline when available
+        if pipeline is None:
+            pipeline = AdvancedFeaturePipeline().fit(profiles)
         X = pipeline.transform(profiles)
-        y = np.array([getattr(p, target) for p in profiles])
 
-        X_train, X_val, y_train, y_val = train_test_split(
-            X, y, test_size=0.2, random_state=42
-        )
+        # Build target according to requested target type
+        if target == 'target_time' or target == 'absolute':
+            y = np.array([p.target_time for p in profiles])
+        elif target == 'delta':
+            # target - previous_best_time (seconds)
+            y = np.array([p.target_time - p.previous_best_time for p in profiles])
+        elif target == 'pct' or target == 'pct_impr':
+            # fractional improvement (target/previous - 1)
+            y = np.array([(p.target_time / p.previous_best_time) - 1.0 for p in profiles])
+        else:
+            # fallback to absolute
+            y = np.array([p.target_time for p in profiles])
 
-        ensemble = EnsembleModel(n_estimators=self.ensemble.n_estimators, model_type=self.ensemble.model_type)
-        ensemble.feature_names = pipeline.feature_names
-        ensemble.fit(X_train, y_train)
+        # Use K-Fold CV for more stable estimates when dataset is small
+        kf = KFold(n_splits=min(5, max(2, len(profiles)//5)), shuffle=True, random_state=42)
 
-        y_pred, uncertainty = ensemble.predict(X_val)
+        maes = []
+        rmses = []
+        r2s = []
+        maes_seconds = []
+        rmses_seconds = []
+        r2s_seconds = []
+        mean_uncs = []
 
+        # Train ensemble per fold and collect metrics
+        for train_idx, val_idx in kf.split(X):
+            X_train, X_val = X[train_idx], X[val_idx]
+            y_train, y_val = y[train_idx], y[val_idx]
+
+            ensemble = EnsembleModel(n_estimators=self.ensemble.n_estimators, model_type=self.ensemble.model_type)
+            ensemble.feature_names = pipeline.feature_names
+            ensemble.fit(X_train, y_train)
+
+            y_pred, uncertainty = ensemble.predict(X_val)
+
+            maes.append(mean_absolute_error(y_val, y_pred))
+            rmses.append(np.sqrt(mean_squared_error(y_val, y_pred)))
+            r2s.append(r2_score(y_val, y_pred))
+
+            # Always keep comparable absolute-seconds metrics for reporting.
+            val_profiles = [profiles[i] for i in val_idx]
+            y_val_sec = self._native_to_absolute(y_val, val_profiles, target)
+            y_pred_sec = self._native_to_absolute(y_pred, val_profiles, target)
+            maes_seconds.append(mean_absolute_error(y_val_sec, y_pred_sec))
+            rmses_seconds.append(np.sqrt(mean_squared_error(y_val_sec, y_pred_sec)))
+            r2s_seconds.append(r2_score(y_val_sec, y_pred_sec))
+            mean_uncs.append(float(np.mean(uncertainty)))
+
+        # Aggregate CV metrics
         training_history = {
-            'mae': mean_absolute_error(y_val, y_pred),
-            'rmse': np.sqrt(mean_squared_error(y_val, y_pred)),
-            'r2': r2_score(y_val, y_pred),
-            'mean_uncertainty': float(np.mean(uncertainty)),
-            'n_samples': len(profiles)
+            'mae': float(np.mean(maes)),
+            'rmse': float(np.mean(rmses)),
+            'r2': float(np.mean(r2s)),
+            'mae_seconds': float(np.mean(maes_seconds)),
+            'rmse_seconds': float(np.mean(rmses_seconds)),
+            'r2_seconds': float(np.mean(r2s_seconds)),
+            'mean_uncertainty': float(np.mean(mean_uncs)),
+            'n_samples': len(profiles),
+            'cv_folds': kf.get_n_splits()
         }
 
-        feature_importance = ensemble.feature_importance(X_val, y_val)
+        # Refit final model on full data for serving
+        final_ensemble = EnsembleModel(n_estimators=self.ensemble.n_estimators, model_type=self.ensemble.model_type)
+        final_ensemble.feature_names = pipeline.feature_names
+        final_ensemble.fit(X, y)
+
+        # Compute feature importance on full data using permutation on a held-out split if possible
+        feature_importance = {}
+        try:
+            # If we have at least 10 samples, compute importances on a small holdout
+            if len(profiles) >= 10:
+                X_tr, X_va, y_tr, y_va = train_test_split(X, y, test_size=0.2, random_state=42)
+                imp_ensemble = EnsembleModel(
+                    n_estimators=self.ensemble.n_estimators,
+                    model_type=self.ensemble.model_type
+                )
+                imp_ensemble.feature_names = pipeline.feature_names
+                imp_ensemble.fit(X_tr, y_tr)
+                feature_importance = imp_ensemble.feature_importance(X_va, y_va)
+            else:
+                # Fallback: use zero importances when insufficient data
+                feature_importance = {fn: 0.0 for fn in pipeline.feature_names}
+        except Exception:
+            feature_importance = {fn: 0.0 for fn in pipeline.feature_names}
 
         return {
-            "ensemble": ensemble,
+            "ensemble": final_ensemble,
             "pipeline": pipeline,
             "training_history": training_history,
             "feature_importance": feature_importance
         }
+
+    def _native_to_absolute(self, values: np.ndarray, profiles: List[SwimmerProfile], target: str) -> np.ndarray:
+        """Convert native target-space values to absolute seconds for comparison/reporting."""
+        arr = np.asarray(values, dtype=float)
+        if target in ('target_time', 'absolute'):
+            return arr
+
+        prev = np.asarray([p.previous_best_time for p in profiles], dtype=float)
+        if target == 'delta':
+            return prev + arr
+        if target in ('pct', 'pct_impr'):
+            return prev * (1.0 + arr)
+        return arr
+
+    def _eval_bundle_mae(self, bundle, profiles: List[SwimmerProfile]) -> float:
+        errs = []
+        for p in profiles:
+            pred, _ = self._predict_with_bundle(p, bundle)
+            errs.append(abs(pred - p.target_time))
+        return float(np.mean(errs)) if errs else float("inf")
+
+    def _bundle_predict_native(self, bundle, profiles: List[SwimmerProfile]) -> np.ndarray:
+        """Predict in the model's native target space (absolute/delta/pct)."""
+        X = bundle["pipeline"].transform(profiles)
+        pred, _ = bundle["ensemble"].predict(X)
+        return np.asarray(pred, dtype=float)
+
+    def _native_targets(self, profiles: List[SwimmerProfile], target: str) -> np.ndarray:
+        """Build ground-truth vector in the same native target space as training."""
+        if target in ('target_time', 'absolute'):
+            return np.array([p.target_time for p in profiles], dtype=float)
+        if target == 'delta':
+            return np.array([p.target_time - p.previous_best_time for p in profiles], dtype=float)
+        if target in ('pct', 'pct_impr'):
+            return np.array([(p.target_time / p.previous_best_time) - 1.0 for p in profiles], dtype=float)
+        return np.array([p.target_time for p in profiles], dtype=float)
+
+    def _train_pool_model_with_gate(
+        self,
+        pool_profiles: List[SwimmerProfile],
+        target: str,
+        pipeline: Optional[AdvancedFeaturePipeline] = None
+    ) -> Tuple[dict, dict]:
+        """
+        Train pool model as a RESIDUAL corrector on top of general model.
+        Gate using seconds-MAE improvement.
+        Returns: (pool_bundle, quality_dict)
+        """
+        # Too small: still train residual, but don't gate hard
+        if len(pool_profiles) < 12:
+            # Train residual on full pool_profiles
+            X_pool = (pipeline or self.feature_pipeline).transform(pool_profiles)
+
+            y_true_native = self._native_targets(pool_profiles, target)
+
+            general_bundle = {"pipeline": self.feature_pipeline, "ensemble": self.ensemble}
+            general_pred_native = self._bundle_predict_native(general_bundle, pool_profiles)
+
+            y_resid = y_true_native - general_pred_native
+
+            pool_ens = EnsembleModel(n_estimators=self.ensemble.n_estimators, model_type=self.ensemble.model_type)
+            pool_ens.feature_names = (pipeline or self.feature_pipeline).feature_names
+            pool_ens.fit(X_pool, y_resid)
+
+            bundle = {
+                "ensemble": pool_ens,
+                "pipeline": (pipeline or self.feature_pipeline),
+                "residual": True,
+                "target_space": target
+            }
+            q = {
+                "n": len(pool_profiles),
+                "use_pool_model": True,
+                "reason": "small_pool_no_holdout_residual"
+            }
+            return bundle, q
+
+        train_p, val_p = train_test_split(pool_profiles, test_size=0.25, random_state=42)
+
+        pipe = pipeline or self.feature_pipeline
+
+        # ----- TRAIN residual model on train_p -----
+        X_train = pipe.transform(train_p)
+
+        y_train_true_native = self._native_targets(train_p, target)
+        general_bundle = {"pipeline": self.feature_pipeline, "ensemble": self.ensemble}
+        general_train_pred_native = self._bundle_predict_native(general_bundle, train_p)
+
+        y_train_resid = y_train_true_native - general_train_pred_native
+
+        pool_ens = EnsembleModel(n_estimators=self.ensemble.n_estimators, model_type=self.ensemble.model_type)
+        pool_ens.feature_names = pipe.feature_names
+        pool_ens.fit(X_train, y_train_resid)
+
+        pool_bundle = {
+            "ensemble": pool_ens,
+            "pipeline": pipe,
+            "residual": True,
+            "target_space": target
+        }
+
+        # ----- EVAL on val_p (seconds MAE gating) -----
+        # Native truths + general native preds
+        y_val_true_native = self._native_targets(val_p, target)
+        general_val_pred_native = self._bundle_predict_native(general_bundle, val_p)
+
+        # Pool residual preds
+        X_val = pipe.transform(val_p)
+        resid_pred_native, _ = pool_ens.predict(X_val)
+
+        pool_val_pred_native = general_val_pred_native + resid_pred_native
+
+        # Convert to seconds for gating
+        y_val_true_sec = self._native_to_absolute(y_val_true_native, val_p, target)
+        gen_val_pred_sec = self._native_to_absolute(general_val_pred_native, val_p, target)
+        pool_val_pred_sec = self._native_to_absolute(pool_val_pred_native, val_p, target)
+
+        general_mae_seconds = float(np.mean(np.abs(gen_val_pred_sec - y_val_true_sec)))
+        pool_mae_seconds = float(np.mean(np.abs(pool_val_pred_sec - y_val_true_sec)))
+
+        # Gate: use pool model if it is not worse (or better by margin)
+        use_pool = pool_mae_seconds <= (general_mae_seconds * (1.0 - self.pool_gate_margin_pct))
+
+        q = {
+            "n": len(pool_profiles),
+            "target_space": target,
+            "pool_mae_seconds": pool_mae_seconds,
+            "general_mae_seconds": general_mae_seconds,
+            "delta_mae_seconds": (general_mae_seconds - pool_mae_seconds),
+            "pool_gate_margin_pct": float(self.pool_gate_margin_pct),
+            "use_pool_model": bool(use_pool),
+            "reason": "pool_better_or_equal_seconds" if use_pool else "pool_worse_than_general_seconds"
+        }
+
+        # keep compatibility fields (optional)
+        q["pool_mae"] = q["pool_mae_seconds"]
+        q["general_mae"] = q["general_mae_seconds"]
+        q["delta_mae"] = q["delta_mae_seconds"]
+
+        return pool_bundle, q
     
     def predict(self, profile: SwimmerProfile) -> Tuple[float, float]:
         """
-        Predict with uncertainty
-        Returns:
-            prediction: Expected race time
-            uncertainty: Model uncertainty (std dev)
+        Default prediction API used by evaluate() and report generator.
+        Uses pool-routing when available (with gating), otherwise falls back to general model.
+        Returns (predicted_time_seconds, uncertainty_seconds).
         """
-        X = self.feature_pipeline.transform(profile)
-        
-        # Try event-specific model first
-        if profile.event_category in self.event_models:
-            bundle = self.event_models[profile.event_category]
-            X = bundle["pipeline"].transform(profile)
-            pred, unc = bundle["ensemble"].predict(X)
-        else:
-            X = self.feature_pipeline.transform(profile)
-            pred, unc = self.ensemble.predict(X)
-        
-        return float(pred[0]), float(unc[0])
+        pred, unc, _used_pool = self.predict_pool_routed(profile)
+        return pred, unc
+
+    def predict_general_only(self, profile: SwimmerProfile) -> Tuple[float, float]:
+        bundle = {"pipeline": self.feature_pipeline, "ensemble": self.ensemble}
+        return self._predict_with_bundle(profile, bundle)
     
-    def get_feature_importance(self) -> Dict[str, float]:
-        """Get feature importance rankings"""
-        if not hasattr(self, 'feature_importance'):
-            raise ValueError("Model must be trained first")
+    def _predict_with_bundle(self, profile: SwimmerProfile, bundle) -> Tuple[float, float]:
+        X = bundle["pipeline"].transform(profile)
+        pred, unc = bundle["ensemble"].predict(X)
+        pred_val = float(pred[0])
+        unc_val = float(unc[0])
+
+        tt = getattr(self, 'target_type', 'target_time')
+        if tt == 'delta':
+            return profile.previous_best_time + pred_val, unc_val
+        elif tt in ('pct', 'pct_impr'):
+            return profile.previous_best_time * (1.0 + pred_val), unc_val * profile.previous_best_time
+        else:
+            return pred_val, unc_val
         
-        return self.feature_importance
+    def predict_pool_routed(self, profile: SwimmerProfile) -> Tuple[float, float, bool]:
+        bundle = self.pool_models.get(profile.environment.pool_type)
+        pool_ok = True
+        q = getattr(self, "pool_model_quality", {}).get(profile.environment.pool_type)
+        if q is not None and getattr(self, "use_pool_gating", True):
+            pool_ok = bool(q.get("use_pool_model", True))
+
+        used_pool_model = (bundle is not None and pool_ok)
+
+        if used_pool_model:
+            general_bundle = {"pipeline": self.feature_pipeline, "ensemble": self.ensemble}
+            gen_native = self._bundle_predict_native(general_bundle, [profile])[0]
+
+            Xp = bundle["pipeline"].transform(profile)
+            resid_native, resid_unc = bundle["ensemble"].predict(Xp)
+            pred_native = float(gen_native + resid_native[0])
+            unc_native = float(resid_unc[0])
+        else:
+            # fallback to general native
+            general_bundle = {"pipeline": self.feature_pipeline, "ensemble": self.ensemble}
+            Xg = general_bundle["pipeline"].transform(profile)
+            pred_native_arr, unc_native_arr = general_bundle["ensemble"].predict(Xg)
+            pred_native = float(pred_native_arr[0])
+            unc_native = float(unc_native_arr[0])
+
+        # Convert native -> absolute seconds same way as _predict_with_bundle does
+        tt = getattr(self, 'target_type', 'target_time')
+        if tt == 'delta':
+            return profile.previous_best_time + pred_native, unc_native, used_pool_model
+        elif tt in ('pct', 'pct_impr'):
+            return profile.previous_best_time * (1.0 + pred_native), unc_native * profile.previous_best_time, used_pool_model
+        else:
+            return pred_native, unc_native, used_pool_model
+
+    def predict_event_routed(self, profile: SwimmerProfile) -> Tuple[float, float]:
+        """Force event routing: event model if exists else general."""
+        bundle = self.event_models.get(profile.event_category)
+        if bundle is None:
+            bundle = {"pipeline": self.feature_pipeline, "ensemble": self.ensemble}
+        return self._predict_with_bundle(profile, bundle)
     
     def save_model(self, filepath: str):
         """Save trained model to disk"""
@@ -775,7 +1130,12 @@ class EnhancedSwimPredictor:
             'feature_importance': self.feature_importance,
             'model_version': self.model_version,
             'training_timestamp': self.training_timestamp,
-            'event_models': self.event_models
+            'event_models': self.event_models,
+            'pool_models': self.pool_models,
+            'pool_model_quality': self.pool_model_quality,
+            'use_pool_gating': self.use_pool_gating,
+            'pool_gate_margin_pct': self.pool_gate_margin_pct,
+            'target_type': getattr(self, 'target_type', 'target_time')
         }
         joblib.dump(model_data, filepath)
     
@@ -792,6 +1152,11 @@ class EnhancedSwimPredictor:
         predictor.model_version = model_data['model_version']
         predictor.training_timestamp = model_data['training_timestamp']
         predictor.event_models = model_data.get('event_models', {})
+        predictor.pool_models = model_data.get('pool_models', {})
+        predictor.pool_model_quality = model_data.get('pool_model_quality', {})
+        predictor.use_pool_gating = model_data.get('use_pool_gating', True)
+        predictor.pool_gate_margin_pct = model_data.get('pool_gate_margin_pct', 0.10)
+        predictor.target_type = model_data.get('target_type', 'target_time')
         
         return predictor
 
@@ -933,7 +1298,7 @@ class ComprehensiveReportGenerator:
         red_zone_threshold = pred_time * (1.0 + slowdown)
         
         # Feature importance
-        feature_importance = self.predictor.get_feature_importance()
+        feature_importance = self.predictor.feature_importance if isinstance(getattr(self.predictor, "feature_importance", None), dict) else {}
         
         # Training readiness
         acwr = profile.training.acwr
@@ -945,6 +1310,16 @@ class ComprehensiveReportGenerator:
             readiness = "HIGH LOAD"
         else:
             readiness = "OVERTRAINING RISK"
+
+        target_type = getattr(self.predictor, 'target_type', 'target_time')
+        model_mae_seconds = self.predictor.training_history.get(
+            'mae_seconds',
+            self.predictor.training_history.get('mae')
+        )
+        model_r2_seconds = self.predictor.training_history.get(
+            'r2_seconds',
+            self.predictor.training_history.get('r2')
+        )
         
         # Compile comprehensive certificate
         certificate = {
@@ -962,6 +1337,8 @@ class ComprehensiveReportGenerator:
                 'previous_best': profile.previous_best_time,
                 'target_time': profile.target_time,
                 'improvement_potential': ((profile.previous_best_time - pred_time) / profile.previous_best_time) * 100,
+                    'absolute_error': abs(pred_time - profile.target_time),
+                    'relative_error': (abs(pred_time - profile.target_time) / profile.target_time) if profile.target_time != 0 else None,
                 'absolute_physiological_limit': simulation_results['absolute_physiological_limit'],
                 'perfect_storm_time': simulation_results['perfect_storm_time'],
                 'red_zone_threshold': red_zone_threshold,
@@ -1024,8 +1401,9 @@ class ComprehensiveReportGenerator:
             
             'model_confidence': {
                 'prediction_uncertainty': model_uncertainty,
-                'model_mae': self.predictor.training_history.get('mae', 0),
-                'model_r2': self.predictor.training_history.get('r2', 0),
+                # Always report seconds-space metrics for comparability.
+                'model_mae': model_mae_seconds,
+                'model_r2': model_r2_seconds,
                 'feature_importance': dict(sorted(
                     feature_importance.items(),
                     key=lambda x: abs(x[1]),
@@ -1033,6 +1411,10 @@ class ComprehensiveReportGenerator:
                 )[:15])
             }
         }
+
+        if target_type not in ['target_time', 'absolute']:
+            certificate['model_confidence']['model_mae_native'] = self.predictor.training_history.get('mae')
+            certificate['model_confidence']['model_r2_native'] = self.predictor.training_history.get('r2')
         
         return certificate
     
@@ -1050,6 +1432,10 @@ class ComprehensiveReportGenerator:
         print(f"   Predicted Time: {certificate['performance_metrics']['predicted_time']:.2f}s")
         print(f"   Previous Best: {certificate['performance_metrics']['previous_best']:.2f}s")
         print(f"   Improvement: {certificate['performance_metrics']['improvement_potential']:.1f}%")
+        if certificate['performance_metrics'].get('absolute_error') is not None:
+            print(f"   Absolute Error: {certificate['performance_metrics']['absolute_error']:.2f}s")
+        if certificate['performance_metrics'].get('relative_error') is not None:
+            print(f"   Relative Error: {certificate['performance_metrics']['relative_error']*100:.2f}%")
         print(f"   🧱 Absolute Physiological Limit: {certificate['performance_metrics']['absolute_physiological_limit']:.2f}s")
         print(f"   ⚡ Perfect Storm Scenario:      {certificate['performance_metrics']['perfect_storm_time']:.2f}s")
         print(f"   🔴 Red-Zone Threshold: {certificate['performance_metrics']['red_zone_threshold']:.2f}s")
@@ -1085,8 +1471,15 @@ class ComprehensiveReportGenerator:
         
         print(f"\n🤖 MODEL METRICS:")
         print(f"   Prediction Uncertainty: ±{certificate['model_confidence']['prediction_uncertainty']:.3f}s")
-        print(f"   Model MAE: {certificate['model_confidence']['model_mae']:.3f}s")
-        print(f"   Model R²: {certificate['model_confidence']['model_r2']:.3f}")
+        if certificate['model_confidence']['model_mae'] is not None:
+            print(f"   Model MAE (seconds): {certificate['model_confidence']['model_mae']:.3f}s")
+            print(f"   Model R² (seconds): {certificate['model_confidence']['model_r2']:.3f}")
+            if certificate['model_confidence'].get('model_mae_native') is not None:
+                print(f"   Model MAE (native target): {certificate['model_confidence']['model_mae_native']:.6f}")
+            if certificate['model_confidence'].get('model_r2_native') is not None:
+                print(f"   Model R² (native target): {certificate['model_confidence']['model_r2_native']:.6f}")
+        else:
+            print(f"   Model MAE / R²: N/A")
         
         print("="*70 + "\n")
 
@@ -1179,73 +1572,6 @@ class HydroPredictEliteApp:
 # Example Usage with Enhanced Features
 # =============================================================================
 
-def create_enhanced_sample_data() -> str:
-    """Create enhanced sample CSV with dynamic column prefixes"""
-    import tempfile
-    
-    # Generate 50 sample athletes with realistic variation
-    np.random.seed(42)
-    n_samples = 50
-    
-    data = {
-        'name': [f"Athlete_{i}" for i in range(n_samples)],
-        'event': np.random.choice(
-            ['50m Free', '100m Free', '200m Free', '400m Free', '200m IM'],
-            n_samples
-        ),
-        'previous_best_time': np.random.normal(55, 5, n_samples),
-        'target_time': np.random.normal(54, 5, n_samples),
-        
-        # Biometrics with bio_ prefix
-        'bio_hrv': np.random.normal(65, 10, n_samples),
-        'bio_resting_hr': np.random.normal(50, 5, n_samples),
-        'bio_sleep_hours': np.random.normal(8, 1, n_samples),
-        'bio_sleep_quality': np.random.normal(80, 10, n_samples),
-        'bio_muscle_soreness': np.random.uniform(1, 10, n_samples),
-        'bio_body_mass': np.random.normal(75, 8, n_samples),
-        'bio_hydration_estimate': np.random.normal(95, 3, n_samples),
-        'bio_blood_lactate': np.random.exponential(2, n_samples),
-        
-        # Environment with env_ prefix
-        'env_water_temp': np.random.normal(27.5, 1, n_samples),
-        'env_air_temp': np.random.normal(24, 2, n_samples),
-        'env_humidity': np.random.normal(55, 10, n_samples),
-        'env_pressure': np.random.normal(1013, 5, n_samples),
-        'env_altitude': np.random.choice([0, 500, 1000], n_samples),
-        'env_lane_number': np.random.randint(1, 9, n_samples),
-        'env_pool_type': np.random.choice(['LCM', 'SCM', 'SCY'], n_samples),
-        
-        # Stroke metrics with stroke_ prefix
-        'stroke_stroke_rate': np.random.normal(55, 8, n_samples),
-        'stroke_stroke_length': np.random.normal(2.1, 0.3, n_samples),
-        'stroke_distance_per_stroke': np.random.normal(2.0, 0.3, n_samples),
-        'stroke_turn_time': np.random.normal(0.8, 0.2, n_samples),
-        'stroke_underwater_distance': np.random.normal(12, 3, n_samples),
-        'stroke_intra_cycle_velocity_fluctuation': np.random.exponential(0.15, n_samples),
-        
-        # Cognitive with cog_ prefix
-        'cog_stress_level': np.random.uniform(1, 10, n_samples),
-        'cog_screen_time': np.random.exponential(3, n_samples),
-        'cog_gaming_hours': np.random.exponential(1, n_samples),
-        'cog_focus_rating': np.random.uniform(1, 10, n_samples),
-        'cog_pre_race_anxiety': np.random.uniform(1, 10, n_samples),
-        
-        # Training with train_ prefix
-        'train_acute_load': np.random.normal(800, 200, n_samples),
-        'train_chronic_load': np.random.normal(750, 150, n_samples),
-        'train_weekly_yardage': np.random.normal(35000, 5000, n_samples),
-        'train_training_stress_balance': np.random.normal(0, 3, n_samples)
-    }
-    
-    df = pd.DataFrame(data)
-    
-    temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False)
-    df.to_csv(temp_file.name, index=False)
-    temp_file.close()
-    
-    return temp_file.name
-
-
 def main():
     """Enhanced example demonstrating all advanced features"""
     print("="*70)
@@ -1256,20 +1582,241 @@ def main():
     print("\n⚙️ Initializing system with 5-model ensemble...")
     app = HydroPredictEliteApp(model_type='auto', n_ensemble=5)
     
-    # Create enhanced sample data
-    print("\n📝 Creating enhanced sample dataset...")
-    sample_csv = create_enhanced_sample_data()
-    
-    # Load and train with event-specific models
-    print("\n🎯 Training with event-specific modeling...")
-    profiles = app.load_and_train(sample_csv, use_event_specific=True)
-    
-    # Save model
+    # Use provided swimmers_import.csv from repository instead of generating
+    print("\n📝 Using provided swimmers_import.csv in repository...")
+    generated_sample = False
+    sample_csv = r"C:/Users/levir/Downloads/HydroPredict-main/swimmers_import.csv"
+    profiles = app.data_pipeline.load_from_csv(sample_csv)
+
+    # Holdout split for realistic evaluation (train on train, evaluate on test)
+    pool_labels = [p.environment.pool_type.value for p in profiles]
+    train_profiles, test_profiles = train_test_split(
+        profiles,
+        test_size=0.25,
+        random_state=42,
+        stratify=pool_labels
+    )
+    print(f"📚 Data split: train={len(train_profiles)} | test={len(test_profiles)}")
+
+    # Experiment targets to try
+    targets = ['target_time', 'delta', 'pct']
+    results = {}
+
+    def evaluate(predictor, profiles):
+        # returns overall MAE, per-event MAE dict, per-pool MAE dict,
+        # plus mean/median relative errors and per-event/pool relative MAE
+        from collections import defaultdict
+        import numpy as _np
+
+        errors = []
+        rel_errors = []
+        per_event = defaultdict(list)
+        per_event_rel = defaultdict(list)
+        per_pool = defaultdict(list)
+        per_pool_rel = defaultdict(list)
+
+        for p in profiles:
+            pred, _ = predictor.predict(p)
+            true = p.target_time
+            err = abs(pred - true)
+            rel = abs(pred - true) / true if true != 0 else 0.0
+            errors.append(err)
+            rel_errors.append(rel)
+            per_event[p.event].append(err)
+            per_event_rel[p.event].append(rel)
+            per_pool[p.environment.pool_type.value].append(err)
+            per_pool_rel[p.environment.pool_type.value].append(rel)
+
+        overall_mae = float(_np.mean(errors))
+        overall_mean_rel = float(_np.mean(rel_errors))
+        overall_median_rel = float(_np.median(rel_errors))
+
+        per_event_mae = {k: float(_np.mean(v)) for k, v in per_event.items()}
+        per_pool_mae = {k: float(_np.mean(v)) for k, v in per_pool.items()}
+
+        per_event_rel_mae = {k: float(_np.mean(v)) for k, v in per_event_rel.items()}
+        per_pool_rel_mae = {k: float(_np.mean(v)) for k, v in per_pool_rel.items()}
+
+        return {
+            'overall_mae': overall_mae,
+            'overall_mean_rel': overall_mean_rel,
+            'overall_median_rel': overall_median_rel,
+            'per_event_mae': per_event_mae,
+            'per_pool_mae': per_pool_mae,
+            'per_event_rel_mae': per_event_rel_mae,
+            'per_pool_rel_mae': per_pool_rel_mae
+        }
+
+    def per_pool_comparison_report(predictor: EnhancedSwimPredictor, profiles: List[SwimmerProfile], min_slice_n: int = 5):
+        from collections import defaultdict
+
+        def baseline_pred(p):
+            return p.previous_best_time
+
+        # Accumulators
+        pool_rows = defaultdict(list)  # pool -> list of dicts per swimmer
+        slice_rows = defaultdict(list) # (pool, event) -> list of dicts
+
+        total = 0
+        routed_used = 0
+
+        for p in profiles:
+            total += 1
+
+            base = baseline_pred(p)
+            gen, _ = predictor.predict_general_only(p)
+            prt, _, used_pool = predictor.predict_pool_routed(p)
+
+            if used_pool:
+                routed_used += 1
+
+            true = p.target_time
+
+            def err(x):
+                return abs(x - true)
+
+            def rel(x):
+                return (abs(x - true) / true) if true != 0 else 0.0
+
+            row = {
+                "base_err": err(base), "base_rel": rel(base),
+                "gen_err":  err(gen),  "gen_rel":  rel(gen),
+                "prt_err":  err(prt),  "prt_rel":  rel(prt),
+            }
+
+            pool_key = p.environment.pool_type.value
+            pool_rows[pool_key].append(row)
+            slice_rows[(pool_key, p.event)].append(row)
+
+        def summarize(rows):
+            if not rows:
+                return None
+            base_mae = float(np.mean([r["base_err"] for r in rows]))
+            gen_mae = float(np.mean([r["gen_err"] for r in rows]))
+            prt_mae = float(np.mean([r["prt_err"] for r in rows]))
+            base_rel = float(np.mean([r["base_rel"] for r in rows]))
+            gen_rel = float(np.mean([r["gen_rel"] for r in rows]))
+            prt_rel = float(np.mean([r["prt_rel"] for r in rows]))
+            return base_mae, base_rel, gen_mae, gen_rel, prt_mae, prt_rel
+
+        overall = summarize([r for rows in pool_rows.values() for r in rows])
+
+        print("\n" + "="*72)
+        print("📊 PER-POOL COMPARISON REPORT (Baseline vs General vs Pool-Routed)")
+        print("="*72)
+        if overall:
+            base_mae, base_rel, gen_mae, gen_rel, prt_mae, prt_rel = overall
+            print("\nOverall:")
+            print(f"  Baseline MAE: {base_mae:.3f}s | mean rel {base_rel*100:.2f}%")
+            print(f"  General  MAE: {gen_mae:.3f}s | mean rel {gen_rel*100:.2f}%")
+            print(f"  PoolRt   MAE: {prt_mae:.3f}s | mean rel {prt_rel*100:.2f}%")
+            print(f"  Routing: pool model used {100.0*routed_used/total:.1f}% ({routed_used} / {total})")
+
+        print("\nPer-pool:")
+        for pool_key in sorted(pool_rows.keys()):
+            rows = pool_rows[pool_key]
+            base_mae, base_rel, gen_mae, gen_rel, prt_mae, prt_rel = summarize(rows)
+            n = len(rows)
+            print(f"\n  {pool_key} (n={n}):")
+            print(f"    Baseline: MAE {base_mae:.3f}s | mean rel {base_rel*100:.2f}%")
+            print(f"    General : MAE {gen_mae:.3f}s | mean rel {gen_rel*100:.2f}%   (Δ vs base {gen_mae-base_mae:+.3f}s)")
+            print(f"    PoolRt  : MAE {prt_mae:.3f}s | mean rel {prt_rel*100:.2f}%   (Δ vs gen  {prt_mae-gen_mae:+.3f}s)")
+
+        # Slice analysis (pool|event)
+        helps = []
+        hurts = []
+        for (pool_key, event), rows in slice_rows.items():
+            if len(rows) < min_slice_n:
+                continue
+            _, _, gen_mae, _, prt_mae, _ = summarize(rows)
+            diff = gen_mae - prt_mae  # positive = PoolRt helps
+            item = (diff, pool_key, event, len(rows), gen_mae, prt_mae)
+            if diff >= 0:
+                helps.append(item)
+            else:
+                hurts.append(item)
+
+        helps.sort(reverse=True, key=lambda x: x[0])
+        hurts.sort(key=lambda x: x[0])
+
+        print(f"\nTop pool|event slices (n>={min_slice_n}) where PoolRt helps most vs General:")
+        for diff, pool_key, event, n, gen_mae, prt_mae in helps[:10]:
+            print(f"  +{diff:.3f}s  {pool_key} | {event} (n={n})  General {gen_mae:.3f}s -> PoolRt {prt_mae:.3f}s")
+
+        print(f"\nWorst pool|event slices (n>={min_slice_n}) where PoolRt is worse than General:")
+        for diff, pool_key, event, n, gen_mae, prt_mae in hurts[:10]:
+            print(f"  {diff:.3f}s  {pool_key} | {event} (n={n})  General {gen_mae:.3f}s -> PoolRt {prt_mae:.3f}s")
+
+        print("="*72)
+
+
+    # Run experiments
+    for t in targets:
+        print(f"\n🔬 Training target: {t}")
+        # create fresh app/predictor for each run
+        exp_app = HydroPredictEliteApp(model_type='auto', n_ensemble=5)
+        exp_app.data_pipeline = app.data_pipeline
+        # train with chosen target
+        exp_app.predictor.train(
+            train_profiles,
+            use_event_specific=True,
+            use_pool_specific=True,
+            target=t
+        )
+        print("Pool gate decisions:")
+        for k, v in exp_app.predictor.pool_model_quality.items():
+            print(" ", k.value, v)
+        print("Pool models trained:", [k.value for k in exp_app.predictor.pool_models.keys()])
+        eval_res = evaluate(exp_app.predictor, test_profiles)
+        results[t] = {
+            'overall_mae': eval_res['overall_mae'],
+            'overall_mean_rel': eval_res['overall_mean_rel'],
+            'overall_median_rel': eval_res['overall_median_rel'],
+            'per_event_mae': eval_res['per_event_mae'],
+            'per_pool_mae': eval_res['per_pool_mae'],
+            'per_event_rel_mae': eval_res['per_event_rel_mae'],
+            'per_pool_rel_mae': eval_res['per_pool_rel_mae'],
+            'predictor': exp_app.predictor
+        }
+        print(f"   Completed {t} (holdout): overall MAE={eval_res['overall_mae']:.3f}s, mean rel={eval_res['overall_mean_rel']*100:.2f}%")
+
+    # Compare per-event and per-pool averages
+    def avg_dict(d):
+        import numpy as _np
+        return float(_np.mean(list(d.values()))) if d else float('inf')
+
+    # Weighted winner selection: 70% overall MAE + 30% average per-event MAE
+    scored = []
+    for target_name, target_res in results.items():
+        overall_mae = target_res['overall_mae']
+        per_event_avg = avg_dict(target_res['per_event_mae'])
+        score = overall_mae * 0.7 + per_event_avg * 0.3
+        scored.append((score, overall_mae, target_name, per_event_avg))
+
+    scored.sort(key=lambda x: (x[0], x[1]))  # tie-break on overall MAE
+    winner = scored[0][2]
+
+    print("\n🎯 Target scoring (0.7*overall + 0.3*per-event-avg):")
+    for score, overall_mae, target_name, per_event_avg in scored:
+        print(f"   {target_name:11s} score={score:.4f} | overall={overall_mae:.4f} | per-event-avg={per_event_avg:.4f}")
+
+    print(f"\n🏆 Selected winning target: {winner}")
+
+    # Use winner predictor as main app predictor and save
+    app.predictor = results[winner]['predictor']
+    app.feature_pipeline = app.predictor.feature_pipeline
+    app.training_timestamp = app.predictor.training_timestamp
+    # reconnect report generator and mark trained
+    app.report_generator = ComprehensiveReportGenerator(app.predictor, app.simulator)
+    app.trained = True
+
+    per_pool_comparison_report(app.predictor, test_profiles, min_slice_n=5)
+
     app.save_model("hydropredict_elite_model.pkl")
     
     # Analyze a specific athlete
     print("\n🔬 Generating comprehensive performance certificate...")
-    test_athlete = profiles[0]
+    test_athlete = test_profiles[0]
     certificate = app.analyze_athlete(test_athlete)
     
     # Print certificate
@@ -1280,7 +1827,7 @@ def main():
     
     # Batch analysis example
     print("\n📊 Batch analysis for all athletes...")
-    all_certificates = app.batch_analyze(profiles[:5])  # First 5 athletes
+    all_certificates = app.batch_analyze(test_profiles[:5])  # First 5 holdout athletes
     
     # Show summary statistics
     predicted_times = [c['performance_metrics']['predicted_time'] for c in all_certificates]
@@ -1300,8 +1847,9 @@ def main():
     test_certificate = new_app.analyze_athlete(test_athlete)
     print(f"✅ Loaded model prediction: {test_certificate['performance_metrics']['predicted_time']:.2f}s")
     
-    # Cleanup
-    os.unlink(sample_csv)
+    # Cleanup (only remove if we generated a temporary sample file)
+    if 'generated_sample' in locals() and generated_sample:
+        os.unlink(sample_csv)
     
     print("\n" + "="*70)
     print("✅ HydroPredict Elite demonstration complete!")
